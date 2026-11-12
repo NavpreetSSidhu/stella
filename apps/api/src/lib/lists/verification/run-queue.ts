@@ -521,6 +521,7 @@ type ResolvedFile = {
   fileId: string;
   mimeType: string;
   pdfFileId: string | null;
+  sizeBytes: number;
 };
 
 /** The pinned file, or why it can no longer be read as pinned. Read under
@@ -556,6 +557,7 @@ const resolvePinnedFile = async (
     fileId: row.content.id,
     mimeType: row.content.mimeType,
     pdfFileId: row.content.pdfFileId,
+    sizeBytes: row.content.sizeBytes,
   });
 };
 
@@ -684,6 +686,7 @@ const executeRun = async ({
     workspaceId: actor.workspaceId,
     file: file.value,
     signal: abortSignal,
+    admissionWaitMs: RUN_TIMEOUT_MS,
   });
   if (document.type === "unsupported-format") {
     return "unsupported_format";
@@ -691,7 +694,9 @@ const executeRun = async ({
   if (document.type === "no-text") {
     return "no_text";
   }
-  const passages = runPassages(document.blocks, run.scope);
+  // Still waiting on the document byte budget when the run timed out.
+  const passages =
+    document.type === "busy" ? null : runPassages(document.blocks, run.scope);
   if (passages === null || passages.length === 0) {
     return "extraction_failed";
   }
