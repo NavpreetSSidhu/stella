@@ -30,8 +30,10 @@ import {
   FAKE_CLAUDE_VERSION,
   FAKE_ESCAPE_COMMAND,
   FAKE_LONG_COMMAND,
+  FAKE_LONG_PLAN,
   FAKE_MCP_CALL,
   FAKE_PERMISSION_SUGGESTION,
+  FAKE_PLAN,
   FAKE_PRIVATE_TEXT,
   FAKE_RESUMED_SESSION_ID,
   FAKE_SANDBOX_HOST,
@@ -1090,7 +1092,7 @@ describe("Claude Code adapter over stream-json stdio", () => {
         },
       ],
       capabilities: ["approvals", "interrupt", "resume", "image_input"],
-      approvalModes: ["ask", "auto", "full_auto"],
+      approvalModes: ["plan", "ask", "auto", "full_auto"],
       // The exhausted model-specific window does not count.
       usageLimit: { resetsAt: "2099-10-28T14:00:00Z" },
     });
@@ -1212,6 +1214,118 @@ describe("Claude Code approval modes", () => {
   };
   const valueOf = (args: readonly string[], flag: string) =>
     args.includes(flag) ? args[args.indexOf(flag) + 1] : undefined;
+
+  test("plan starts the CLI in plan mode, without the sandbox, and allows no stella call ahead", async () => {
+    const args = await argsFor("plan");
+    expect(valueOf(args, "--permission-mode")).toBe("plan");
+    expect(args).not.toContain("--settings");
+    // A stella write before the plan is approved is asked about.
+    expect(args).not.toContain("--allowedTools");
+    expect(valueOf(await argsFor("ask"), "--allowedTools")).toMatch(/^mcp__/u);
+  });
+
+  test("a plan opens with its approval, which shows the plan and offers approve or deny; approving it switches the CLI to Ask's mode once the plan's call has run", async () => {
+    const seen: string[] = [];
+    const { events, answers, controlRequests } = await run("plan_approved", {
+      overrides: {
+        policy: { network: "open", fs: "workspace", approvals: "plan" },
+      },
+      onEvent: async (event, turn) => {
+        seen.push(event.type);
+        if (event.type !== "approval.requested") {
+          return;
+        }
+        expect(event.request).toMatchObject({
+          kind: "tool",
+          toolCall: {
+            id: "call-plan",
+            name: "harness_native_tool",
+            input: {
+              tool: "ExitPlanMode",
+              detail: { kind: "proposed_plan", text: FAKE_PLAN },
+            },
+          },
+        });
+        // The CLI's suggestion to switch modes is never offered.
+        expect(event.request.options.map(({ decision }) => decision)).toEqual([
+          "approve",
+          "deny",
+        ]);
+        await turn.respond({
+          type: "approval",
+          requestId: event.request.requestId,
+          decision: "approve",
+        });
+      },
+    });
+    // No call opens before the approval that carries the plan.
+    expect(seen.indexOf("approval.requested")).toBeLessThan(
+      seen.indexOf("tool.completed"),
+    );
+    expect(seen).not.toContain("tool.started");
+    expect(answers()).toEqual([
+      {
+        subtype: "success",
+        request_id: "cli-1",
+        response: {
+          behavior: "allow",
+          updatedInput: { plan: FAKE_PLAN, planFilePath: "/plans/lease.md" },
+        },
+      },
+    ]);
+    expect(
+      controlRequests("set_permission_mode").map(({ request }) => request),
+    ).toEqual([{ subtype: "set_permission_mode", mode: "acceptEdits" }]);
+    expect(terminal(events)?.type).toBe("turn.completed");
+  });
+
+  test("a declined plan keeps the CLI in plan mode", async () => {
+    const { events, answers, controlRequests } = await run("plan_declined", {
+      overrides: {
+        policy: { network: "open", fs: "workspace", approvals: "plan" },
+      },
+      onEvent: async (event, turn) => {
+        if (event.type === "approval.requested") {
+          await turn.respond({
+            type: "approval",
+            requestId: event.request.requestId,
+            decision: "deny",
+          });
+        }
+      },
+    });
+    expect(answers()).toEqual([
+      {
+        subtype: "success",
+        request_id: "cli-1",
+        response: { behavior: "deny", message: "The user denied this action." },
+      },
+    ]);
+    expect(controlRequests("set_permission_mode")).toEqual([]);
+    expect(terminal(events)?.type).toBe("turn.completed");
+  });
+
+  test("a plan too long to show in full is never put to the member: the CLI is told to shorten it", async () => {
+    expect(FAKE_LONG_PLAN.length).toBeGreaterThan(20_000);
+    const { events, answers, controlRequests } = await run("plan_too_long", {
+      overrides: {
+        policy: { network: "open", fs: "workspace", approvals: "plan" },
+      },
+    });
+    expect(events.map(({ type }) => type)).not.toContain("approval.requested");
+    expect(answers()).toEqual([
+      {
+        subtype: "success",
+        request_id: "cli-1",
+        response: {
+          behavior: "deny",
+          message: expect.stringContaining("too long for the user to review"),
+        },
+      },
+    ]);
+    expect(controlRequests("set_permission_mode")).toEqual([]);
+    expect(terminal(events)?.type).toBe("turn.completed");
+  });
 
   test("ask accepts edits in the workspace and asks about the rest, without the sandbox", async () => {
     const args = await argsFor("ask");
@@ -1349,6 +1463,7 @@ describe("Claude Code approval modes", () => {
       const harness = harnessFor("probe", { platform });
       const probed = await harness.adapter.probe();
       expect(Result.isOk(probed) && probed.value.approvalModes).toEqual([
+        "plan",
         "ask",
         "auto",
       ]);

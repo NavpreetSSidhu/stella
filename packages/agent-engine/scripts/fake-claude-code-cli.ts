@@ -244,6 +244,30 @@ export const FAKE_PERMISSION_SUGGESTION = {
   destination: "localSettings",
 };
 
+/** The plan the plan scenarios propose, as the CLI adds it to the call. */
+export const FAKE_PLAN = "## Plan\n\n1. Read the lease.\n2. Draft the notice.";
+
+/** What the CLI suggests remembering when it asks about a plan in plan mode. */
+const SET_MODE_SUGGESTION = {
+  type: "setMode",
+  mode: "acceptEdits",
+  destination: "session",
+};
+
+/** A plan longer than chat shows (20,000 UTF-16 code units). */
+export const FAKE_LONG_PLAN = `## Plan\n\n${"1. Read the lease.\n".repeat(1200)}`;
+
+/** The plan call as the CLI asks about it: the model's input plus the plan. */
+const proposePlan = (toolUseId: string, plan = FAKE_PLAN): FakeStep[] => [
+  assistant("msg-plan", [toolUse(toolUseId, "ExitPlanMode", {})]),
+  canUseTool(
+    toolUseId,
+    "ExitPlanMode",
+    { plan, planFilePath: "/plans/lease.md" },
+    { permission_suggestions: [SET_MODE_SUGGESTION] },
+  ),
+];
+
 /** The host a sandboxed command reaches in the sandbox scenarios. */
 export const FAKE_SANDBOX_HOST = "registry.example.test";
 
@@ -590,6 +614,31 @@ const FAKE_SCENARIOS = {
     ),
     toolResult("call-out", "File created."),
     assistant("msg-3", [{ type: "text", text: "Left the draft in place." }]),
+    result(),
+  ],
+  /** An approved plan, then the turn continues in its approved mode. */
+  plan_approved: [
+    ...freshTurn(),
+    ...proposePlan("call-plan"),
+    toolResult("call-plan", "User has approved your plan."),
+    { expect: "set_permission_mode" },
+    assistant("msg-2", [{ type: "text", text: "Drafting the notice." }]),
+    result(),
+  ],
+  /** A declined plan: the CLI stays in plan mode and the turn ends. */
+  plan_declined: [
+    ...freshTurn(),
+    ...proposePlan("call-plan"),
+    toolResult("call-plan", "The user denied this action.", true),
+    assistant("msg-2", [{ type: "text", text: "Waiting for a new plan." }]),
+    result(),
+  ],
+  /** A plan too long to show: refused without asking, the CLI stays in plan mode. */
+  plan_too_long: [
+    ...freshTurn(),
+    ...proposePlan("call-plan", FAKE_LONG_PLAN),
+    toolResult("call-plan", "The plan is too long.", true),
+    assistant("msg-2", [{ type: "text", text: "Shortening the plan." }]),
     result(),
   ],
   /** An approval without suggested rules offers no session-wide decision. */

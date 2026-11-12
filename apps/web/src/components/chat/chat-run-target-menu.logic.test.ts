@@ -4,10 +4,10 @@ import {
   CHAT_LOCAL_RUN_DEFAULT_MAX_APPROVALS,
   CHAT_LOCAL_RUN_HARNESSES,
   type ChatLocalHarnessReadiness,
+  type ChatLocalRunApprovalCeiling,
   type ChatLocalRunnerReadiness,
   type ChatLocalRunReadiness,
 } from "@stll/api-contract/chat-run-target";
-import type { DesktopRunnerApprovalMode } from "@stll/api-contract/desktop-runner";
 
 import {
   CHAT_LOCAL_HARNESS_NAMES,
@@ -155,7 +155,7 @@ const READY_CLAUDE: Extract<ChatLocalHarnessOption, { state: "ready" }> = {
   harness: "claude-code",
   state: "ready",
   models: [{ id: "sonnet", label: "Sonnet", reasoningEfforts: [] }],
-  approvalModes: ["ask", "auto"],
+  approvalModes: ["plan", "ask", "auto"],
 };
 const CLAUDE = { ...LOCAL, harness: "claude-code", model: "sonnet" } as const;
 
@@ -174,6 +174,7 @@ describe("the permission choice", () => {
     expect(permissionView(CLAUDE, [READY_CLAUDE], NO_LIMIT)).toEqual({
       type: "choice",
       modes: [
+        { mode: "plan", availability: "available" },
         { mode: "ask", availability: "available" },
         { mode: "auto", availability: "available" },
         { mode: "full_auto", availability: "computer" },
@@ -182,9 +183,11 @@ describe("the permission choice", () => {
   });
 
   test("a mode above the organization's limit is unavailable for that reason; one the computer cannot run says so first", () => {
+    // Plan continues as Ask once approved, so every limit allows it.
     expect(permissionView(CLAUDE, [READY_CLAUDE], "ask")).toEqual({
       type: "choice",
       modes: [
+        { mode: "plan", availability: "available" },
         { mode: "ask", availability: "available" },
         { mode: "auto", availability: "organization" },
         { mode: "full_auto", availability: "computer" },
@@ -192,11 +195,12 @@ describe("the permission choice", () => {
     });
     const sandboxing = {
       ...READY_CLAUDE,
-      approvalModes: ["ask", "auto", "full_auto"],
+      approvalModes: ["plan", "ask", "auto", "full_auto"],
     } as const;
     expect(permissionView(CLAUDE, [sandboxing], "auto")).toEqual({
       type: "choice",
       modes: [
+        { mode: "plan", availability: "available" },
         { mode: "ask", availability: "available" },
         { mode: "auto", availability: "available" },
         { mode: "full_auto", availability: "organization" },
@@ -228,6 +232,11 @@ describe("the permission choice", () => {
       ...CLAUDE,
       model: "opus",
       approvals: "auto",
+    });
+    expect(pick({ ...CLAUDE, approvals: "plan" })).toEqual({
+      ...CLAUDE,
+      model: "opus",
+      approvals: "plan",
     });
     expect(pick({ ...CLAUDE, approvals: "full_auto" })).toEqual({
       ...CLAUDE,
@@ -345,7 +354,7 @@ describe("the selected run target", () => {
       models: [{ id: "sonnet", label: "Sonnet", reasoningEfforts: [] }],
     };
     const readiness = (
-      maxApprovals: DesktopRunnerApprovalMode,
+      maxApprovals: ChatLocalRunApprovalCeiling,
       harness: ChatLocalHarnessReadiness = sandboxingClaude,
     ): ChatLocalRunReadiness => ({
       status: "enabled",

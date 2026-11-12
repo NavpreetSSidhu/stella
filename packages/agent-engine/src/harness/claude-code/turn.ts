@@ -2,6 +2,7 @@ import { panic, Result } from "better-result";
 import type { Temporal } from "temporal-polyfill/full";
 import * as v from "valibot";
 
+import { CHAT_LOCAL_RUN_TOOL_LIMITS } from "@stll/api-contract/chat-local-run-tool";
 import {
   chatLocalRunAnswersRefusal,
   chatLocalRunQuestionsSchema,
@@ -37,6 +38,7 @@ import {
   ASK_USER_QUESTION_TOOL,
   claudeMessageHandling,
   claudeSystemHandling,
+  EXIT_PLAN_MODE_TOOL,
   toolCallForUse,
   toolResultFor,
 } from "./items";
@@ -75,8 +77,9 @@ import {
  * content block, so streamed text deltas are paired with the block they
  * belong to by message id and order; a question is the `AskUserQuestion`
  * tool's permission prompt, answered by allowing the call with the answers
- * in its input; a subagent's messages carry the tool call that started it
- * and are not this turn's output.
+ * in its input; a proposed plan is the `ExitPlanMode` tool's permission
+ * prompt, whose input the CLI fills with the plan; a subagent's messages
+ * carry the tool call that started it and are not this turn's output.
  */
 
 /** Native permission replies, as the runner protocol's decisions. */
@@ -91,8 +94,18 @@ const ONE_OFF_OPTIONS = CLAUDE_APPROVAL_OPTIONS.filter(
   ({ decision }) => decision !== "approve_for_session",
 );
 
+/**
+ * A suggested rule of this type would change the turn's permission mode; the
+ * mode is the member's choice for the thread, so it is never offered.
+ */
+const SET_MODE_SUGGESTION = "setMode";
+
 /** What the model reads when the user denies a tool call. */
 const DENIED_MESSAGE = "The user denied this action.";
+/** Chat shows a proposed plan up to this length; a longer one is never put
+ *  to the member, since approving it would approve steps they cannot see. */
+const MAX_PLAN_CHARS = CHAT_LOCAL_RUN_TOOL_LIMITS.proposedPlan;
+const PLAN_TOO_LONG_MESSAGE = `The plan is too long for the user to review: keep it under ${MAX_PLAN_CHARS} characters and propose it again.`;
 /** Rules granted for the session stay in memory, never in a settings file. */
 const SESSION_DESTINATION = "session";
 const MAX_REASON_CHARS = 2000;
@@ -107,6 +120,8 @@ type PendingInteraction =
       input: Readonly<Record<string, unknown>>;
       /** Permission rules the CLI suggests remembering, if approved. */
       suggestions: readonly Readonly<Record<string, unknown>>[];
+      /** The `ExitPlanMode` call this approval answers, else `null`. */
+      planToolUseId: string | null;
     }
   | {
       type: "question";
@@ -284,6 +299,12 @@ type ClaudeCodeTurnSessionOptions = {
    * about like any other action.
    */
   sandboxNetworkHosts: ReadonlySet<string>;
+  /**
+   * The CLI mode a turn started in plan mode switches to once the member
+   * approves its plan; `null` for a turn at any other level, where an
+   * approved plan returns the CLI to the mode it planned from.
+   */
+  approvedPlanMode: string | null;
 };
 
 /**
@@ -302,6 +323,8 @@ export class ClaudeCodeTurnSession {
   private readonly toolUses = new Map<string, HeldToolUse>();
   private readonly pending = new Map<string, PendingInteraction>();
   private readonly resolved = new Set<string>();
+  /** Approved `ExitPlanMode` calls whose result has not arrived yet. */
+  private readonly approvedPlans = new Set<string>();
   /** Text block ids streamed per assistant message, in block order. */
   private readonly streamedTexts = new Map<string, string[]>();
   /** The streamed message's text block ids by content block index. */
@@ -314,12 +337,15 @@ export class ClaudeCodeTurnSession {
   private readonly lifecycle: HarnessTurnLifecycle<ClaudeCliClient>;
   private readonly stellaServer: string;
   private readonly sandboxNetworkHosts: ReadonlySet<string>;
+  private readonly approvedPlanMode: string | null;
+  private readonly detached: Detached;
 
   constructor({
     gracePeriodMs,
     detached,
     stellaServer,
     sandboxNetworkHosts,
+    approvedPlanMode,
   }: ClaudeCodeTurnSessionOptions) {
     this.lifecycle = new HarnessTurnLifecycle({
       gracePeriodMs,
@@ -328,6 +354,8 @@ export class ClaudeCodeTurnSession {
     });
     this.stellaServer = stellaServer;
     this.sandboxNetworkHosts = sandboxNetworkHosts;
+    this.approvedPlanMode = approvedPlanMode;
+    this.detached = detached;
   }
 
   /** Handlers for the process; messages before `begin` are held. */
@@ -658,7 +686,11 @@ export class ClaudeCodeTurnSession {
         case "tool_use": {
           const toolCall = toolCallForUse(block, this.stellaServer);
           this.toolUses.set(block.id, { use: block, toolCall });
-          this.emit({ type: "tool.started", toolCall });
+          // A proposed plan opens with its approval: the CLI adds the plan
+          // to the call's input only when it asks about the call.
+          if (block.name !== EXIT_PLAN_MODE_TOOL) {
+            this.emit({ type: "tool.started", toolCall });
+          }
           break;
         }
         case "redacted_thinking":
@@ -708,6 +740,9 @@ export class ClaudeCodeTurnSession {
               ? { ...result, status: "cancelled" }
               : result,
         });
+      }
+      if (this.approvedPlans.delete(block.tool_use_id)) {
+        this.leavePlanMode(block.is_error === true);
       }
     }
   }
@@ -797,20 +832,42 @@ export class ClaudeCodeTurnSession {
     const requestId = requestIdFor(controlId);
     const use = { name: parsed.tool_name, input: parsed.input };
     const held = this.toolUses.get(parsed.tool_use_id);
+    const proposesPlan = parsed.tool_name === EXIT_PLAN_MODE_TOOL;
+    // A proposed plan's call is built from this input, which carries the
+    // plan the member approves.
     const toolCall =
-      held?.toolCall ??
-      toolCallForUse({ id: parsed.tool_use_id, ...use }, this.stellaServer);
-    this.toolUses.set(parsed.tool_use_id, held ?? { use, toolCall });
+      held === undefined || proposesPlan
+        ? toolCallForUse({ id: parsed.tool_use_id, ...use }, this.stellaServer)
+        : held.toolCall;
+    this.toolUses.set(parsed.tool_use_id, {
+      use: held?.use ?? use,
+      toolCall,
+    });
     if (parsed.tool_name === ASK_USER_QUESTION_TOOL) {
       this.question(controlId, toolCall, parsed.input);
       return;
     }
-    const suggestions = parsed.permission_suggestions ?? [];
+    const plan = parsed.input["plan"];
+    if (
+      proposesPlan &&
+      typeof plan === "string" &&
+      plan.length > MAX_PLAN_CHARS
+    ) {
+      this.client?.respond(controlId, {
+        behavior: "deny",
+        message: PLAN_TOO_LONG_MESSAGE,
+      });
+      return;
+    }
+    const suggestions = (parsed.permission_suggestions ?? []).filter(
+      ({ type }) => type !== SET_MODE_SUGGESTION,
+    );
     this.pending.set(requestId, {
       type: "approval",
       controlId,
       input: parsed.input,
       suggestions,
+      planToolUseId: proposesPlan ? parsed.tool_use_id : null,
     });
     const reason =
       parsed.decision_reason ?? parsed.description ?? parsed.title ?? null;
@@ -913,8 +970,38 @@ export class ClaudeCodeTurnSession {
     }
     // The call's own result follows from the harness once it has run.
     client.respond(interaction.controlId, result.value);
+    if (
+      interaction.type === "approval" &&
+      interaction.planToolUseId !== null &&
+      response.type === "approval" &&
+      response.decision === "approve"
+    ) {
+      this.approvedPlans.add(interaction.planToolUseId);
+    }
     this.settle(requestId);
     return Result.ok();
+  }
+
+  /**
+   * An approved plan has run its `ExitPlanMode` call, which returned the CLI
+   * to `default`; a turn started in plan mode now continues in its approved
+   * mode. The switch waits for the call's result so the CLI's own exit from
+   * plan mode has finished, and until it lands the CLI asks more, never less.
+   */
+  private leavePlanMode(failed: boolean) {
+    const mode = this.approvedPlanMode;
+    const client = this.client;
+    if (failed || mode === null || client === null || this.lifecycle.ended) {
+      return;
+    }
+    this.detached(this.switchMode(client, mode), "claude-turn.leavePlanMode");
+  }
+
+  private async switchMode(client: ClaudeCliClient, mode: string) {
+    const switched = await client.request("set_permission_mode", { mode });
+    if (Result.isError(switched)) {
+      this.violation("The harness did not leave plan mode.");
+    }
   }
 
   private async interrupt() {
