@@ -4,6 +4,7 @@ import path from "node:path";
 import * as v from "valibot";
 
 import { PACKAGE_CACHE_FOLDERS } from "../src/harness/package-cache";
+import { browseAsAgent, codexMcpEndpoints } from "./fake-browser";
 import { fakeHarnessLog, openFakeHarnessPeer } from "./fake-harness-peer";
 import {
   FAKE_STELLA_ANSWER,
@@ -48,7 +49,12 @@ type FakeStep =
   | { spawn: readonly string[]; in?: "own_group" | "orphan" }
   | { raw: string }
   | { sleep: number }
-  | { exit: number };
+  | { exit: number }
+  /**
+   * Browse the fixture library through the browser and stella MCP servers
+   * `thread/start` configured, and report each call and the answer.
+   */
+  | { browse: true };
 
 const userAgent = (version: string) =>
   `stella/${version} (Mac OS 27.0; arm64) test`;
@@ -57,6 +63,8 @@ export const FAKE_OUTDATED_VERSION = "0.150.0";
 export const FAKE_THREAD_ID = "thread-a";
 export const FAKE_RESUMED_THREAD_ID = "thread-old";
 const FAKE_TURN_ID = "turn-1";
+/** The server name the holder registers the browser tools under. */
+const FAKE_BROWSER_SERVER = "stella_browser";
 
 const signedIn = {
   account: { type: "chatgpt", email: null, planType: "plus" },
@@ -254,6 +262,8 @@ const tokenUsage = (usage: {
 const FAKE_SKILL_PATH = process.env["FAKE_SKILL_PATH"] ?? "/skills/none";
 
 const FAKE_SCENARIOS = {
+  /** The local browser canary: a search, a result, a sign-in, a citation. */
+  browse: [...freshTurn(), { browse: true }, completed()],
   /**
    * The shared stella tool calls through the stella MCP binding, step by
    * step: a step's calls all start, then complete. Then an answer.
@@ -1151,11 +1161,15 @@ const run = async (
     }
   };
   let serverRequestId = 1000;
+  let threadStart: unknown = undefined;
   for (const step of steps) {
     if ("expect" in step) {
       const message = await nextRequest(step.expect);
       if (message === null) {
         return;
+      }
+      if (message.method === "thread/start") {
+        threadStart = message["params"];
       }
       if (message.method !== step.expect) {
         log({ unexpected: message.method, wanted: step.expect });
@@ -1199,6 +1213,43 @@ const run = async (
       process.stdout.write(`${step.raw}\n`);
     } else if ("sleep" in step) {
       await Bun.sleep(step.sleep);
+    } else if ("browse" in step) {
+      const browsed = await browseAsAgent({
+        browserServer: FAKE_BROWSER_SERVER,
+        endpoints: codexMcpEndpoints(threadStart),
+        stellaServer: FAKE_STELLA_SERVER,
+      });
+      const notifyItem = (phase: "started" | "completed", body: object) => {
+        write({
+          method: `item/${phase}`,
+          params: {
+            threadId: FAKE_THREAD_ID,
+            turnId: FAKE_TURN_ID,
+            item: body,
+          },
+        });
+      };
+      for (const call of browsed.steps) {
+        const mcpCall = {
+          type: "mcpToolCall",
+          id: call.id,
+          server: call.server,
+          tool: call.tool,
+          arguments: call.arguments,
+          error: null,
+        };
+        notifyItem("started", {
+          ...mcpCall,
+          status: "inProgress",
+          result: null,
+        });
+        notifyItem("completed", {
+          ...mcpCall,
+          status: call.isError ? "failed" : "completed",
+          result: { content: [{ type: "text", text: call.text }] },
+        });
+      }
+      notifyItem("completed", agentMessage("m-browse", browsed.answer));
     } else {
       process.exit(step.exit);
     }
