@@ -172,6 +172,7 @@ const turnInput = (
     url: "https://mcp.example.test/mcp",
     token: MCP_TOKEN,
   },
+  browser: null,
   transcript,
   inputFiles: [],
   continuation: { type: "fresh" },
