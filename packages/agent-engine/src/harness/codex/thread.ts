@@ -40,6 +40,8 @@ export const CODEX_APPROVAL_MODE =
 const APPROVAL_POLICY = "on-request";
 /** A dotted config key carries the name, so it must stay a bare TOML key. */
 const MCP_SERVER_NAME = /^[A-Za-z0-9_-]+$/u;
+/** How long a browser tool call may wait, the member's approval included. */
+const BROWSER_TOOL_TIMEOUT_SECONDS = 3600;
 
 /** The skills Codex installs with itself; none comes from a member's files. */
 const SYSTEM_SKILL_SCOPE = "system";
@@ -183,6 +185,8 @@ const threadParams = (
               url: input.browser.url,
               http_headers: { Authorization: `Bearer ${input.browser.token}` },
               default_tools_approval_mode: "approve",
+              // Typing outside a search field waits for the member's answer.
+              tool_timeout_sec: BROWSER_TOOL_TIMEOUT_SECONDS,
             },
           }),
     },
