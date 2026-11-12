@@ -57,7 +57,7 @@ import {
   installPgliteInvoiceObjects,
   installPgliteLegislationExpressionIdentity,
   installPgliteLegislationPayloadRevision,
-  installPgliteListVerificationBudgets,
+  installPgliteModelRunBudgets,
   installPgliteOrganizationDeleteOwnerGuard,
   installPgliteOrganizationMemberCapacity,
   installPglitePdfSigningTokenScopes,
@@ -899,7 +899,7 @@ export const buildFullTestPglite = async (): Promise<PGlite> => {
   await installPgliteChatTurnRunIdLookup(db);
   await installPgliteOrganizationMemberCapacity(db);
   await installPgliteWorkspaceContactCapacity(db);
-  await installPgliteListVerificationBudgets(db);
+  await installPgliteModelRunBudgets(db);
   await installPgliteChatRunLogRls(db);
   await installPgliteAccountAuditRls(db);
   await installPgliteChatMessageRevisionsRls(db);
